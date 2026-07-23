@@ -10,6 +10,8 @@ import {
 } from "../../../utils/metadata/channelCredentials.js";
 import { cleanPersistedMetadataInPlace } from "../../../utils/metadata/metadataSecurity.js";
 import { buildFileMetadataForManagement } from "../../../utils/metadata/metadataView.js";
+import { assertCanAccessFile } from "../../../utils/auth/authCore.js";
+import { applyUserUploadPrefix } from "../../../utils/userUploadConfig.js";
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -21,6 +23,7 @@ const corsHeaders = {
 
 export async function onRequest(context) {
     const { request, env, params, waitUntil } = context;
+    const identity = context.data?.identity || { scope: 'admin', authorized: true };
 
     // OPTIONS 预检请求
     if (request.method === 'OPTIONS') {
@@ -53,6 +56,19 @@ export async function onRequest(context) {
                 status: 400,
                 headers: { 'Content-Type': 'application/json', ...corsHeaders },
             });
+        }
+
+        // 用户只能操作自己的文件
+        const dbPre = getDatabase(env);
+        const pre = await dbPre.getWithMetadata(fileId);
+        if (pre?.metadata) {
+            const access = assertCanAccessFile(identity, pre.metadata);
+            if (!access.ok) {
+                return new Response(JSON.stringify({ success: false, message: access.reason }), {
+                    status: access.status || 403,
+                    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+                });
+            }
         }
 
         // 解析请求体

@@ -9,14 +9,21 @@ import {
     resolveWebDAVCredentials,
 } from "../../../utils/metadata/channelCredentials.js";
 import { cleanPersistedMetadata } from "../../../utils/metadata/metadataSecurity.js";
+import { assertCanAccessFile } from "../../../utils/auth/authCore.js";
+import { applyUserUploadPrefix } from "../../../utils/userUploadConfig.js";
 
 export async function onRequest(context) {
     const { request, env, params, waitUntil } = context;
+    const identity = context.data?.identity || { scope: 'admin', authorized: true };
 
     const url = new URL(request.url);
 
     // 读取目标文件夹，并进行路径安全处理
-    const rawDist = url.searchParams.get('dist') || '';
+    let rawDist = url.searchParams.get('dist') || '';
+    // 用户移动目标强制落在自己前缀下
+    if (identity.scope === 'user' && identity.userId) {
+        rawDist = applyUserUploadPrefix(identity.userId, sanitizeUploadFolder(rawDist));
+    }
     const dist = sanitizeUploadFolder(rawDist);
 
     // 读取folder参数，判断是否为文件夹移动请求
@@ -106,6 +113,17 @@ export async function onRequest(context) {
         const fileKey = fileId.split('/').pop();
         const newFileId = dist === '' ? fileKey : `${dist}/${fileKey}`;
         const cdnUrl = `https://${url.hostname}/file/${fileId}`;
+
+        const dbPre = getDatabase(env);
+        const pre = await dbPre.getWithMetadata(fileId);
+        if (pre?.metadata) {
+            const access = assertCanAccessFile(identity, pre.metadata);
+            if (!access.ok) {
+                return new Response(JSON.stringify({ success: false, error: access.reason }), {
+                    status: access.status || 403,
+                });
+            }
+        }
 
         const success = await moveFile(env, fileId, newFileId, cdnUrl, url);
         if (!success) {

@@ -1,19 +1,20 @@
 /**
  * 统一认证核心
  * 所有认证逻辑的单一来源，按优先级依次尝试各种认证方式
+ * 返回完整身份上下文：scope / userId / username 等
  */
 
 import { fetchSecurityConfig } from '../sysConfig.js';
 import { validateApiToken } from './tokenValidator.js';
 import { getDatabase } from '../databaseAdapter.js';
-import { verifyPassword } from './passwordHash.js';
 import { validateSession } from './sessionManager.js';
+import { getUserById, isMultiUserEnabled } from '../userStore.js';
 
 /**
  * 认证范围常量
- * - 'admin'  : 仅管理员（admin session / API Token）
- * - 'user'   : 仅用户（user session / admin session / API Token / authCode）
- * - 'either' : 管理员或用户任一通过即可（所有认证方式）
+ * - 'admin'  : 仅管理员（admin session / admin API Token）
+ * - 'user'   : 用户侧（user session / admin session / user|admin API Token）
+ * - 'either' : 管理员或用户任一通过即可
  */
 export const AUTH_SCOPE = {
     ADMIN: 'admin',
@@ -21,59 +22,98 @@ export const AUTH_SCOPE = {
     EITHER: 'either',
 };
 
-const AUTHORIZED = (authType) => ({ authorized: true, authType });
-const UNAUTHORIZED = { authorized: false, authType: null };
+const UNAUTHORIZED = {
+    authorized: false,
+    authType: null,
+    scope: null,
+    userId: null,
+    username: null,
+    tokenId: null,
+    permissions: null,
+};
+
+function identity({
+    authorized = true,
+    authType,
+    scope,
+    userId = null,
+    username = null,
+    tokenId = null,
+    permissions = null,
+}) {
+    return {
+        authorized,
+        authType,
+        scope: scope || authType,
+        userId,
+        username,
+        tokenId,
+        permissions,
+    };
+}
 
 /**
  * 管理员会话认证
- * 检查 admin session
- *
- * @returns {Promise<{authorized: boolean, authType: string|null}|null>}
- *          认证通过返回结果，未通过返回 null（交给调用方继续）
+ * @returns {Promise<object|null>}
  */
 async function checkAdmin({ env, request, adminConfigured }) {
     if (!adminConfigured) {
-        return AUTHORIZED('admin'); // 未配置管理员认证，视为管理员身份放行
+        return identity({ authType: 'admin', scope: 'admin' });
     }
 
     const session = await validateSession(env, request, 'admin');
     if (session.valid) {
-        return AUTHORIZED('admin');
+        return identity({
+            authType: 'admin',
+            scope: 'admin',
+            username: session.session.username || '',
+        });
     }
 
     return null;
 }
 
 /**
- * 用户会话/凭据认证
- * 优先级：admin session → user session → authCode
+ * 用户会话认证（多用户账号；不再接受全局 authCode）
+ * 优先级：admin session → user session（校验 users 表且未禁用）
+ * 无多用户且未强制时：放行为匿名 user（兼容未建用户前的开放上传）
  *
- * @returns {Promise<{authorized: boolean, authType: string|null}|null>}
- *          认证通过/失败返回结果，无法判定返回 null
+ * @returns {Promise<object|null>}
  */
-async function checkUser({ env, request, url, authCodeConfigured, userAuthCode }) {
+async function checkUser({ env, request, multiUserEnabled }) {
     // admin session（管理员身份也可访问用户资源）
     const adminSession = await validateSession(env, request, 'admin');
     if (adminSession.valid) {
-        return AUTHORIZED('admin');
+        return identity({
+            authType: 'admin',
+            scope: 'admin',
+            username: adminSession.session.username || '',
+        });
     }
 
     // user session
     const userSession = await validateSession(env, request, 'user');
     if (userSession.valid) {
-        return AUTHORIZED('user');
-    }
-
-    // authCode
-    if (!authCodeConfigured) {
-        return AUTHORIZED('user'); // 未配置用户认证，视为用户身份放行
-    }
-
-    if (url) {
-        const authCode = extractAuthCode(url, request);
-        if (authCode && await verifyPassword(authCode, userAuthCode)) {
-            return AUTHORIZED('user');
+        const userId = userSession.session.userId || null;
+        // 无 userId 的旧 session（authCode 时代）一律失效
+        if (!userId) {
+            return multiUserEnabled ? UNAUTHORIZED : null;
         }
+        const user = await getUserById(env, userId);
+        if (!user || user.disabled) {
+            return UNAUTHORIZED;
+        }
+        return identity({
+            authType: 'user',
+            scope: 'user',
+            userId: user.id,
+            username: user.username,
+        });
+    }
+
+    // 未启用多用户时保持开放（与历史「未配置 authCode 放行」一致）
+    if (!multiUserEnabled) {
+        return identity({ authType: 'user', scope: 'user' });
     }
 
     return UNAUTHORIZED;
@@ -83,12 +123,12 @@ async function checkUser({ env, request, url, authCodeConfigured, userAuthCode }
  * 统一认证函数
  *
  * @param {Object} options
- * @param {Object} options.env - 环境变量
- * @param {Request} options.request - 请求对象
- * @param {URL} [options.url] - 请求URL（authCode 提取需要）
- * @param {string|null} [options.requiredPermission] - API Token 所需权限
- * @param {'admin'|'user'|'either'} [options.authScope='either'] - 认证范围
- * @returns {Promise<{authorized: boolean, authType: 'admin'|'user'|null}>}
+ * @param {Object} options.env
+ * @param {Request} options.request
+ * @param {URL} [options.url]
+ * @param {string|null} [options.requiredPermission]
+ * @param {'admin'|'user'|'either'} [options.authScope='either']
+ * @returns {Promise<object>} identity
  */
 export async function authenticate({
     env,
@@ -101,67 +141,106 @@ export async function authenticate({
     const securityConfig = await fetchSecurityConfig(env);
     const adminUsername = securityConfig.auth.admin.adminUsername;
     const adminPassword = securityConfig.auth.admin.adminPassword;
-    const userAuthCode = securityConfig.auth.user.authCode;
 
     const adminConfigured = !!(adminUsername && adminUsername.trim()) || !!(adminPassword && adminPassword.trim());
-    const authCodeConfigured = !!(userAuthCode && userAuthCode.trim());
+    const multiUserEnabled = await isMultiUserEnabled(env);
 
-    // --- API Token 验证（公共层，所有 scope 通用） ---
+    // --- API Token 验证（公共层） ---
     const db = getDatabase(env);
     const tokenResult = await validateApiToken(request, db, requiredPermission);
-    if (tokenResult.valid) {
-        return AUTHORIZED('admin');
+    if (tokenResult.valid && tokenResult.tokenData) {
+        const t = tokenResult.tokenData;
+        // 新模型：必须有 scope；旧 token 无 scope → 拒绝（决策 13）
+        const scope = t.scope || null;
+        if (!scope) {
+            // 兼容：仅当显式 type==='admin' 且无 userId 时不在此放行——一律要求 scope
+            return UNAUTHORIZED;
+        }
+        if (scope === 'admin') {
+            if (authScope === AUTH_SCOPE.USER || authScope === AUTH_SCOPE.EITHER || authScope === AUTH_SCOPE.ADMIN) {
+                // admin token 在 USER/EITHER/ADMIN 均可用（USER 场景下管理员可上传）
+                if (authScope === AUTH_SCOPE.ADMIN || authScope === AUTH_SCOPE.EITHER || authScope === AUTH_SCOPE.USER) {
+                    return identity({
+                        authType: 'admin',
+                        scope: 'admin',
+                        tokenId: t.id,
+                        permissions: t.permissions || [],
+                        username: t.owner || '',
+                    });
+                }
+            }
+        }
+        if (scope === 'user') {
+            if (!t.userId) {
+                return UNAUTHORIZED;
+            }
+            if (authScope === AUTH_SCOPE.ADMIN) {
+                return UNAUTHORIZED;
+            }
+            const user = await getUserById(env, t.userId);
+            if (!user || user.disabled) {
+                return UNAUTHORIZED;
+            }
+            return identity({
+                authType: 'user',
+                scope: 'user',
+                userId: user.id,
+                username: user.username,
+                tokenId: t.id,
+                permissions: t.permissions || [],
+            });
+        }
+        return UNAUTHORIZED;
     }
 
-    // --- 会话/凭据验证 ---
+    // --- 会话验证 ---
     const adminCtx = { env, request, adminConfigured };
-    const userCtx = { env, request, url, authCodeConfigured, userAuthCode };
+    const userCtx = { env, request, multiUserEnabled };
 
     if (authScope === AUTH_SCOPE.ADMIN) {
         return (await checkAdmin(adminCtx)) || UNAUTHORIZED;
     }
 
     if (authScope === AUTH_SCOPE.USER) {
-        return await checkUser(userCtx);
+        const result = await checkUser(userCtx);
+        return result || UNAUTHORIZED;
     }
 
-    // EITHER: 任一通过即可
+    // EITHER
     const adminResult = await checkAdmin(adminCtx);
     if (adminResult?.authorized) return adminResult;
 
-    return await checkUser(userCtx);
+    const userResult = await checkUser(userCtx);
+    return userResult || UNAUTHORIZED;
 }
 
 /**
- * 从多个来源提取 authCode
- * 优先级：URL 参数 > Referer > 请求头 > Cookie
+ * 是否管理员身份
  */
-function extractAuthCode(url, request) {
-    let authCode = url.searchParams.get('authCode');
+export function isAdminIdentity(identityResult) {
+    return !!(identityResult?.authorized && identityResult.scope === 'admin');
+}
 
-    if (!authCode) {
-        const referer = request.headers.get('Referer');
-        if (referer) {
-            try {
-                const refererUrl = new URL(referer);
-                authCode = new URLSearchParams(refererUrl.search).get('authCode');
-            } catch (e) {
-                console.error('Invalid referer URL:', e);
-            }
-        }
+/**
+ * 是否带 userId 的普通用户
+ */
+export function isUserIdentity(identityResult) {
+    return !!(identityResult?.authorized && identityResult.scope === 'user' && identityResult.userId);
+}
+
+/**
+ * 文件访问：admin 全放行；user 仅 OwnerId 匹配
+ */
+export function assertCanAccessFile(identityResult, metadata = {}) {
+    if (!identityResult?.authorized) {
+        return { ok: false, status: 401, reason: 'Unauthorized' };
     }
-
-    if (!authCode) {
-        authCode = request.headers.get('authCode');
+    if (identityResult.scope === 'admin') {
+        return { ok: true };
     }
-
-    if (!authCode) {
-        const cookies = request.headers.get('Cookie');
-        if (cookies) {
-            const match = cookies.match(new RegExp('(^| )authCode=([^;]+)'));
-            authCode = match ? decodeURIComponent(match[2]) : null;
-        }
+    const ownerId = metadata.OwnerId || metadata.ownerId || null;
+    if (identityResult.userId && ownerId && ownerId === identityResult.userId) {
+        return { ok: true };
     }
-
-    return authCode;
+    return { ok: false, status: 403, reason: 'Forbidden' };
 }

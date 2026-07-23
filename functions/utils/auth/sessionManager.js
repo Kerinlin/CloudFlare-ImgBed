@@ -21,10 +21,20 @@ const COOKIE_NAMES = {
  * 创建新会话
  * @param {Object} env - 环境变量
  * @param {string} authType - 认证类型 ('admin' | 'user')
- * @param {string} [username] - 用户名（管理员登录时使用）
+ * @param {string|Object} [usernameOrOptions] - 用户名字符串，或 { username, userId }
  * @returns {Promise<{token: string, cookie: string}>}
  */
-export async function createSession(env, authType, username = '') {
+export async function createSession(env, authType, usernameOrOptions = '') {
+    // 兼容旧签名 createSession(env, type, username)
+    let username = '';
+    let userId = null;
+    if (usernameOrOptions && typeof usernameOrOptions === 'object') {
+        username = usernameOrOptions.username || '';
+        userId = usernameOrOptions.userId || null;
+    } else {
+        username = usernameOrOptions || '';
+    }
+
     // 读取安全策略配置
     const securityConfig = await fetchSecurityConfig(env);
     const accessConfig = securityConfig.access || {};
@@ -40,6 +50,7 @@ export async function createSession(env, authType, username = '') {
     const sessionData = {
         authType,
         username,
+        userId,
         createdAt: Date.now(),
         expiresAt: Date.now() + maxAge * 1000,
     };
@@ -177,6 +188,50 @@ export async function destroySessionsByAuthType(env, authType) {
             } catch {
                 await db.delete(key.name);
                 destroyed++;
+            }
+        }
+
+        cursor = result.cursor;
+        hasMore = !result.list_complete && cursor;
+    }
+
+    return destroyed;
+}
+
+/**
+ * 按 userId 清除用户会话（禁用/改密时踢下线）
+ * @param {Object} env
+ * @param {string} userId
+ * @returns {Promise<number>}
+ */
+export async function destroySessionsByUserId(env, userId) {
+    if (!userId) return 0;
+    const db = getDatabase(env);
+    let destroyed = 0;
+
+    let cursor = undefined;
+    let hasMore = true;
+
+    while (hasMore) {
+        const listOptions = { prefix: SESSION_PREFIX };
+        if (cursor) {
+            listOptions.cursor = cursor;
+        }
+
+        const result = await db.list(listOptions);
+        const keys = result.keys || [];
+
+        for (const key of keys) {
+            try {
+                const sessionStr = await db.get(key.name);
+                if (!sessionStr) continue;
+                const session = JSON.parse(sessionStr);
+                if (session.authType === 'user' && session.userId === userId) {
+                    await db.delete(key.name);
+                    destroyed++;
+                }
+            } catch {
+                // skip
             }
         }
 

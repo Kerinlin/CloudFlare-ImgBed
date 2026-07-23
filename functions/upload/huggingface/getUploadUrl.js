@@ -11,9 +11,9 @@
  */
 
 import { HuggingFaceAPI } from '../../utils/storage/huggingfaceAPI.js';
-import { fetchUploadConfig } from '../../utils/sysConfig.js';
-import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
-import { buildUniqueFileId, getUploadIp, isBlockedUploadIp, createResponse } from '../uploadTools.js';
+import { userAuthIdentity, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
+import { buildUniqueFileId, getUploadIp, isBlockedUploadIp, createResponse, sanitizeUploadFolder } from '../uploadTools.js';
+import { resolveUploadConfigForIdentity, applyUserUploadPrefix } from '../../utils/userUploadConfig.js';
 
 export async function onRequestPost(context) {
     const { request, env } = context;
@@ -23,9 +23,11 @@ export async function onRequestPost(context) {
     try {
         // 鉴权
         const requiredPermission = 'upload';
-        if (!await userAuthCheck(env, url, request, requiredPermission)) {
+        const identity = await userAuthIdentity(env, url, request, requiredPermission);
+        if (!identity.authorized) {
             return UnauthorizedResponse('Unauthorized');
         }
+        context.identity = identity;
 
         // 检查上传IP是否被封禁
         const uploadIp = getUploadIp(request);
@@ -49,8 +51,8 @@ export async function onRequestPost(context) {
             });
         }
 
-        // 获取 HuggingFace 配置
-        const uploadConfig = await fetchUploadConfig(env);
+        // 获取 HuggingFace 配置（按身份）
+        const uploadConfig = await resolveUploadConfigForIdentity(env, identity, context);
         const hfSettings = uploadConfig.huggingface;
 
         if (!hfSettings || !hfSettings.channels || hfSettings.channels.length === 0) {
@@ -82,8 +84,12 @@ export async function onRequestPost(context) {
         if (uploadNameType) {
             url.searchParams.set('uploadNameType', uploadNameType);
         }
-        if (uploadFolder) {
-            url.searchParams.set('uploadFolder', uploadFolder);
+        let folder = sanitizeUploadFolder(uploadFolder || '');
+        if (identity.scope === 'user' && identity.userId) {
+            folder = applyUserUploadPrefix(identity.userId, folder);
+        }
+        if (folder) {
+            url.searchParams.set('uploadFolder', folder);
         }
 
         // 使用统一的文件命名函数生成文件ID

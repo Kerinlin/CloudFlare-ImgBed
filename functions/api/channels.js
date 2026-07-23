@@ -2,10 +2,10 @@
  * 上传渠道列表 API
  * 负责在鉴权后返回当前可用或全部上传渠道的名称与类型
  */
-import { fetchUploadConfig } from '../utils/sysConfig.js';
 import { getUploadConfig } from './manage/sysConfig/upload.js';
 import { getDatabase } from '../utils/databaseAdapter.js';
 import { dualAuthCheck } from '../utils/auth/dualAuth.js';
+import { resolveUploadConfigForIdentity } from '../utils/userUploadConfig.js';
 
 export async function onRequest(context) {
     const { request, env } = context;
@@ -16,8 +16,8 @@ export async function onRequest(context) {
 
     // 双重鉴权检查
     const url = new URL(request.url);
-    const { authorized } = await dualAuthCheck(env, url, request);
-    if (!authorized) {
+    const identity = await dualAuthCheck(env, url, request);
+    if (!identity.authorized) {
         return new Response(JSON.stringify({ error: 'Unauthorized' }), {
             status: 401,
             headers: { 'Content-Type': 'application/json' }
@@ -28,13 +28,13 @@ export async function onRequest(context) {
         const includeDisabled = url.searchParams.get('includeDisabled') === 'true';
 
         let uploadConfig;
-        if (includeDisabled) {
-            // 获取所有上传配置（包括禁用的渠道）
+        if (includeDisabled && identity.scope === 'admin') {
+            // 仅管理员可看含禁用的全局配置
             const db = getDatabase(env);
             uploadConfig = await getUploadConfig(db, env);
         } else {
-            // 获取上传配置（已过滤禁用的渠道）
-            uploadConfig = await fetchUploadConfig(env, context);
+            // 按身份解析（用户：自有渠道优先，按类型回落）
+            uploadConfig = await resolveUploadConfigForIdentity(env, identity, context);
         }
 
         // 构建渠道列表，返回渠道名称和实际的 Channel 类型

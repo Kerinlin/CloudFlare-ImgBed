@@ -1,17 +1,17 @@
 /**
  * 用户端认证工具
- * 基于统一认证核心，保持原有导出签名不变
+ * 基于统一认证核心，保持布尔检查 + 完整 identity 两种导出
  */
 
 import { authenticate, AUTH_SCOPE } from './authCore.js';
 
 /**
- * 客户端用户认证
- * @param {Object} env - 环境变量
- * @param {URL} url - 请求的URL
- * @param {Request} request - 请求对象
- * @param {string|null} requiredPermission - 如果提供，则进行Token权限验证
- * @return {Promise<boolean>} 返回是否认证通过
+ * 客户端用户认证（布尔）
+ * @param {Object} env
+ * @param {URL} url
+ * @param {Request} request
+ * @param {string|null} requiredPermission
+ * @return {Promise<boolean>}
  */
 export async function userAuthCheck(env, url, request, requiredPermission = null) {
     const result = await authenticate({
@@ -22,6 +22,19 @@ export async function userAuthCheck(env, url, request, requiredPermission = null
         authScope: AUTH_SCOPE.USER,
     });
     return result.authorized;
+}
+
+/**
+ * 客户端用户认证（完整 identity）
+ */
+export async function userAuthIdentity(env, url, request, requiredPermission = null) {
+    return authenticate({
+        env,
+        request,
+        url,
+        requiredPermission,
+        authScope: AUTH_SCOPE.USER,
+    });
 }
 
 export function UnauthorizedResponse(reason) {

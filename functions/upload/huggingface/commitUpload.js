@@ -5,10 +5,11 @@
  */
 
 import { HuggingFaceAPI } from '../../utils/storage/huggingfaceAPI.js';
-import { fetchPageConfig, fetchUploadConfig } from '../../utils/sysConfig.js';
+import { fetchPageConfig } from '../../utils/sysConfig.js';
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { moderateContent, endUpload, getUploadIp, getIPAddress, sanitizeUploadFolder, createResponse } from '../uploadTools.js';
-import { userAuthCheck, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
+import { userAuthIdentity, UnauthorizedResponse } from '../../utils/auth/userAuth.js';
+import { resolveUploadConfigForIdentity, applyUserUploadPrefix } from '../../utils/userUploadConfig.js';
 
 export async function onRequestPost(context) {
     const { request, env, waitUntil } = context;
@@ -17,7 +18,8 @@ export async function onRequestPost(context) {
     try {
         // 鉴权
         const requiredPermission = 'upload';
-        if (!await userAuthCheck(env, url, request, requiredPermission)) {
+        const identity = await userAuthIdentity(env, url, request, requiredPermission);
+        if (!identity.authorized) {
             return UnauthorizedResponse('Unauthorized');
         }
 
@@ -44,8 +46,21 @@ export async function onRequestPost(context) {
             });
         }
 
-        // 获取 HuggingFace 配置
-        const uploadConfig = await fetchUploadConfig(env);
+        // 用户路径必须在自己的前缀下
+        if (identity.scope === 'user' && identity.userId) {
+            const requiredPrefix = applyUserUploadPrefix(identity.userId, '');
+            if (sanitizedFullId !== requiredPrefix && !sanitizedFullId.startsWith(requiredPrefix + '/')) {
+                return createResponse(JSON.stringify({
+                    error: 'fullId outside user prefix'
+                }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+        }
+
+        // 获取 HuggingFace 配置（按身份）
+        const uploadConfig = await resolveUploadConfigForIdentity(env, identity, context);
         const hfSettings = uploadConfig.huggingface;
 
         if (!hfSettings || !hfSettings.channels || hfSettings.channels.length === 0) {
@@ -109,7 +124,8 @@ export async function onRequestPost(context) {
             TimeStamp: Date.now(),
             Label: "None",
             Directory: normalizedDirectory,
-            Tags: []
+            Tags: [],
+            OwnerId: (identity.scope === 'user' && identity.userId) ? identity.userId : null,
         };
 
         // 图像审查（公开仓库）

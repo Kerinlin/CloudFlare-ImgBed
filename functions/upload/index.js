@@ -1,5 +1,5 @@
-import { userAuthCheck, UnauthorizedResponse } from "../utils/auth/userAuth";
-import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from "../utils/sysConfig";
+import { userAuthIdentity, UnauthorizedResponse } from "../utils/auth/userAuth";
+import { fetchSecurityConfig, fetchPageConfig } from "../utils/sysConfig";
 import {
     createResponse, getUploadIp, getIPAddress, resolveFileExt,
     moderateContent, purgeCDNCache, isBlockedUploadIp, buildUniqueFileId, endUpload, getImageDimensions,
@@ -13,6 +13,7 @@ import { HuggingFaceAPI } from "../utils/storage/huggingfaceAPI";
 import { WebDAVAPI } from "../utils/storage/webdavAPI";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { resolveUploadConfigForIdentity, applyUserUploadPrefix } from '../utils/userUploadConfig.js';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -22,18 +23,20 @@ export async function onRequest(context) {  // Contents of context object
     const url = new URL(request.url);
     context.url = url;
 
-    // 读取各项配置，存入 context
+    // 鉴权（完整 identity）
+    const requiredPermission = 'upload';
+    const identity = await userAuthIdentity(env, url, request, requiredPermission);
+    if (!identity.authorized) {
+        return UnauthorizedResponse('Unauthorized');
+    }
+    context.identity = identity;
+
+    // 读取各项配置，存入 context（按身份解析渠道）
     const securityConfig = await fetchSecurityConfig(env);
-    const uploadConfig = await fetchUploadConfig(env, context);
+    const uploadConfig = await resolveUploadConfigForIdentity(env, identity, context);
 
     context.securityConfig = securityConfig;
     context.uploadConfig = uploadConfig;
-
-    // 鉴权
-    const requiredPermission = 'upload';
-    if (!await userAuthCheck(env, url, request, requiredPermission)) {
-        return UnauthorizedResponse('Unauthorized');
-    }
 
     // 获得上传IP
     const uploadIp = getUploadIp(request);
@@ -99,6 +102,14 @@ async function processFileUpload(context, formdata = null) {
     // 路径安全性处理：防止路径穿越和特殊字符注入
     uploadFolder = sanitizeUploadFolder(uploadFolder);
 
+    // 普通用户强制 users/{userId}/ 前缀
+    const identity = context.identity;
+    if (identity?.scope === 'user' && identity.userId) {
+        uploadFolder = applyUserUploadPrefix(identity.userId, uploadFolder);
+        // 写回 URL，供 buildUniqueFileId 读取
+        url.searchParams.set('uploadFolder', uploadFolder);
+    }
+
     let uploadChannel = 'TelegramNew';
     switch (urlParamUploadChannel) {
         case 'telegram':
@@ -162,8 +173,12 @@ async function processFileUpload(context, formdata = null) {
         uploadFolder = sanitizeUploadFolder(uploadFolder);
         // 从文件名中去除路径信息，只保留文件名部分
         fileName = fileName.split('/').pop();
+        if (context.identity?.scope === 'user' && context.identity.userId) {
+            uploadFolder = applyUserUploadPrefix(context.identity.userId, uploadFolder);
+            url.searchParams.set('uploadFolder', uploadFolder);
+        }
     }
-    // uploadFolder 已经过 sanitizeUploadFolder 处理，直接使用
+    // uploadFolder 已经过 sanitizeUploadFolder / 用户前缀处理
     const normalizedFolder = uploadFolder;
 
     const metadata = {
@@ -177,7 +192,10 @@ async function processFileUpload(context, formdata = null) {
         TimeStamp: time,
         Label: "None",
         Directory: normalizedFolder === '' ? '' : normalizedFolder + '/',
-        Tags: []
+        Tags: [],
+        OwnerId: (context.identity?.scope === 'user' && context.identity.userId)
+            ? context.identity.userId
+            : null,
     };
 
     // 添加图片尺寸信息

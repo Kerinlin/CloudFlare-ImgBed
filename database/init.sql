@@ -30,7 +30,18 @@ CREATE TABLE IF NOT EXISTS files (
     tg_chat_id TEXT,
     tg_bot_token TEXT,
     is_chunked BOOLEAN DEFAULT FALSE,
-    tags TEXT, 
+    tags TEXT,
+    owner_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    display_name TEXT,
+    disabled INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -80,6 +91,10 @@ CREATE INDEX IF NOT EXISTS idx_files_file_type ON files(file_type);
 CREATE INDEX IF NOT EXISTS idx_files_upload_ip ON files(upload_ip);
 CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_tags ON files(tags);
+CREATE INDEX IF NOT EXISTS idx_files_owner_id ON files(owner_id);
+
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_disabled ON users(disabled);
 
 CREATE INDEX IF NOT EXISTS idx_settings_category ON settings(category);
 
@@ -111,5 +126,11 @@ CREATE TRIGGER IF NOT EXISTS update_other_data_updated_at
     AFTER UPDATE ON other_data
     BEGIN
         UPDATE other_data SET updated_at = CURRENT_TIMESTAMP WHERE key = NEW.key;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS update_users_updated_at
+    AFTER UPDATE ON users
+    BEGIN
+        UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
     END;
 

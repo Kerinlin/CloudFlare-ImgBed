@@ -26,8 +26,8 @@ D1Database.prototype.putFile = function(fileId, value, options) {
         'id, value, metadata, file_name, file_type, file_size, ' +
         'upload_ip, upload_address, list_type, timestamp, ' +
         'label, directory, channel, channel_name, ' +
-        'tg_file_id, tg_chat_id, tg_bot_token, is_chunked' +
-        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'tg_file_id, tg_chat_id, tg_bot_token, is_chunked, tags, owner_id' +
+        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     );
     
     return stmt.bind(
@@ -48,7 +48,9 @@ D1Database.prototype.putFile = function(fileId, value, options) {
         extractedFields.tgFileId,
         extractedFields.tgChatId,
         extractedFields.tgBotToken,
-        extractedFields.isChunked
+        extractedFields.isChunked,
+        extractedFields.tags,
+        extractedFields.ownerId
     ).run();
 };
 
@@ -291,6 +293,14 @@ D1Database.prototype.listIndexOperations = function(options) {
  * 从metadata中提取字段用于索引
  */
 D1Database.prototype.extractMetadataFields = function(metadata) {
+    var tags = metadata.Tags;
+    var tagsStr = null;
+    if (Array.isArray(tags)) {
+        tagsStr = JSON.stringify(tags);
+    } else if (typeof tags === 'string' && tags) {
+        tagsStr = tags;
+    }
+
     return {
         fileName: metadata.FileName || null,
         fileType: metadata.FileType || null,
@@ -306,7 +316,9 @@ D1Database.prototype.extractMetadataFields = function(metadata) {
         tgFileId: metadata.TgFileId || null,
         tgChatId: null,
         tgBotToken: null,
-        isChunked: metadata.IsChunked || false
+        isChunked: metadata.IsChunked || false,
+        tags: tagsStr,
+        ownerId: metadata.OwnerId || metadata.ownerId || null
     };
 };
 

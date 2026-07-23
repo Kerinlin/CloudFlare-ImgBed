@@ -16,6 +16,7 @@ const corsHeaders = {
 export async function onRequest(context) {
     const { request, waitUntil } = context;
     const url = new URL(request.url);
+    const identity = context.data?.identity || { scope: 'admin' };
 
     // 解析查询参数
     let start = parseInt(url.searchParams.get('start'), 10) || 0;
@@ -64,8 +65,11 @@ export async function onRequest(context) {
     }
 
     try {
-        // 特殊操作：重建索引
+        // 特殊操作：重建索引（仅管理员，middleware 已拦；双保险）
         if (action === 'rebuild') {
+            if (identity.scope === 'user') {
+                return new Response('Forbidden', { status: 403, headers: corsHeaders });
+            }
             waitUntil(rebuildIndex(context, (processed) => {
                 console.log(`Rebuilt ${processed} files...`);
             }));
@@ -115,6 +119,10 @@ export async function onRequest(context) {
             });
         }
 
+        const ownerFilter = (identity.scope === 'user' && identity.userId)
+            ? identity.userId
+            : null;
+
         // 普通查询：只返回总数
         if (count === -1 && sum) {
             const result = await readIndex(context, {
@@ -131,8 +139,29 @@ export async function onRequest(context) {
                 countOnly: true
             });
 
+            let totalCount = result.totalCount;
+            // 用户：countOnly 无法按 owner 精确计数时改为拉全量过滤（首期）
+            if (ownerFilter) {
+                const full = await readIndex(context, {
+                    search,
+                    directory: dir,
+                    channel: channelArray,
+                    listType: listTypeArray,
+                    accessStatus: accessStatusArray,
+                    label: labelArray,
+                    fileType: fileTypeArray,
+                    channelName: channelNameArray,
+                    includeTags: includeTagsArray,
+                    excludeTags: excludeTagsArray,
+                    start: 0,
+                    count: -1,
+                    includeSubdirFiles: recursive,
+                });
+                totalCount = filterFilesByOwner(full.files || [], ownerFilter).length;
+            }
+
             return new Response(JSON.stringify({
-                sum: result.totalCount,
+                sum: totalCount,
                 indexLastUpdated: result.indexLastUpdated
             }), {
                 headers: { "Content-Type": "application/json", ...corsHeaders }
@@ -140,11 +169,15 @@ export async function onRequest(context) {
         }
 
         // 普通查询：返回数据
+        // 用户隔离时先取较大窗口再过滤分页（首期策略）
+        const fetchCount = ownerFilter ? -1 : count;
+        const fetchStart = ownerFilter ? 0 : start;
+
         const result = await readIndex(context, {
             search,
             directory: dir,
-            start,
-            count,
+            start: fetchStart,
+            count: fetchCount,
             channel: channelArray,
             listType: listTypeArray,
             accessStatus: accessStatusArray,
@@ -159,6 +192,24 @@ export async function onRequest(context) {
         // 索引读取失败，直接从 KV 中获取所有文件记录
         if (!result.success) {
             const dbRecords = await getAllFileRecords(context.env, dir);
+            let files = dbRecords.files;
+            if (ownerFilter) {
+                files = filterFilesByOwner(files, ownerFilter);
+                const total = files.length;
+                files = files.slice(start, count > 0 ? start + count : undefined);
+                return new Response(JSON.stringify({
+                    files,
+                    directories: ownerFilter ? deriveDirsFromFiles(files, dir) : dbRecords.directories,
+                    totalCount: total,
+                    directFileCount: files.length,
+                    directFolderCount: 0,
+                    returnedCount: files.length,
+                    indexLastUpdated: Date.now(),
+                    isIndexedResponse: false
+                }), {
+                    headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+            }
 
             return new Response(JSON.stringify({
                 files: dbRecords.files,
@@ -174,21 +225,36 @@ export async function onRequest(context) {
             });
         }
 
+        let files = result.files || [];
+        let directories = result.directories || [];
+        let totalCount = result.totalCount;
+
+        if (ownerFilter) {
+            files = filterFilesByOwner(files, ownerFilter);
+            totalCount = files.length;
+            directories = deriveDirsFromFiles(files, dir);
+            if (count > 0) {
+                files = files.slice(start, start + count);
+            } else if (start > 0) {
+                files = files.slice(start);
+            }
+        }
+
         const db = getDatabase(context.env);
         const metadataViewContext = await createMetadataViewContext(db, context.env);
 
         // 转换文件格式
         const compatibleFiles = await Promise.all(
-            result.files.map(file => serializeFileRecordForManagement(db, context.env, file, metadataViewContext))
+            files.map(file => serializeFileRecordForManagement(db, context.env, file, metadataViewContext))
         );
 
         return new Response(JSON.stringify({
             files: compatibleFiles,
-            directories: result.directories,
-            totalCount: result.totalCount,
-            directFileCount: result.directFileCount,
-            directFolderCount: result.directFolderCount,
-            returnedCount: result.returnedCount,
+            directories,
+            totalCount,
+            directFileCount: ownerFilter ? compatibleFiles.length : result.directFileCount,
+            directFolderCount: ownerFilter ? directories.length : result.directFolderCount,
+            returnedCount: compatibleFiles.length,
             indexLastUpdated: result.indexLastUpdated,
             isIndexedResponse: true // 标记这是来自索引的响应
         }), {
@@ -205,6 +271,36 @@ export async function onRequest(context) {
             headers: { "Content-Type": "application/json", ...corsHeaders }
         });
     }
+}
+
+/**
+ * 按 OwnerId 过滤文件（用户隔离；null 仅管理员可见）
+ */
+function filterFilesByOwner(files, ownerId) {
+    if (!ownerId || !Array.isArray(files)) return files || [];
+    return files.filter((file) => {
+        const meta = file.metadata || file;
+        const oid = meta.OwnerId || meta.ownerId || null;
+        return oid === ownerId;
+    });
+}
+
+/**
+ * 从用户可见文件推导目录列表
+ */
+function deriveDirsFromFiles(files, baseDir = '') {
+    const dirs = new Set();
+    const prefix = baseDir || '';
+    for (const file of files || []) {
+        const name = file.name || file.id || '';
+        if (!name.startsWith(prefix)) continue;
+        const rest = name.slice(prefix.length);
+        const slash = rest.indexOf('/');
+        if (slash !== -1) {
+            dirs.add(prefix + rest.slice(0, slash));
+        }
+    }
+    return Array.from(dirs);
 }
 
 async function getAllFileRecords(env, dir) {

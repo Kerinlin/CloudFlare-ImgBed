@@ -11,6 +11,7 @@ import {
     resolveS3Credentials,
     resolveWebDAVCredentials,
 } from '../../../utils/metadata/channelCredentials.js';
+import { assertCanAccessFile } from '../../../utils/auth/authCore.js';
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -22,6 +23,7 @@ const corsHeaders = {
 
 export async function onRequest(context) {
     const { request, env, params, waitUntil } = context;
+    const identity = context.data?.identity || { scope: 'admin', authorized: true };
 
     const url = new URL(request.url);
 
@@ -56,7 +58,7 @@ export async function onRequest(context) {
                     const fileId = file.name;
                     const cdnUrl = `https://${url.hostname}/file/${fileId}`;
 
-                    const success = await deleteFile(env, fileId, cdnUrl, url);
+                    const success = await deleteFile(env, fileId, cdnUrl, url, identity);
                     if (success) {
                         deletedFiles.push(fileId);
                     } else {
@@ -104,7 +106,7 @@ export async function onRequest(context) {
         const fileId = params.path.split(',').join('/');
         const cdnUrl = `https://${url.hostname}/file/${fileId}`;
 
-        const success = await deleteFile(env, fileId, cdnUrl, url);
+        const success = await deleteFile(env, fileId, cdnUrl, url, identity);
         if (!success) {
             throw new Error('Delete file failed');
         } else {
@@ -119,18 +121,19 @@ export async function onRequest(context) {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
     } catch (e) {
+        const status = e.message === 'Forbidden' ? 403 : 400;
         return new Response(JSON.stringify({
             success: false,
             error: e.message
         }), {
-            status: 400,
+            status,
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
     }
 }
 
 // 删除单个文件的核心函数
-async function deleteFile(env, fileId, cdnUrl, url) {
+async function deleteFile(env, fileId, cdnUrl, url, identity = { scope: 'admin', authorized: true }) {
     try {
         // 读取图片信息
         const db = getDatabase(env);
@@ -140,6 +143,11 @@ async function deleteFile(env, fileId, cdnUrl, url) {
         if (!img) {
             console.warn(`File ${fileId} not found in database, skipping delete`);
             return true;
+        }
+
+        const access = assertCanAccessFile(identity, img.metadata || {});
+        if (!access.ok) {
+            throw new Error(access.reason === 'Forbidden' ? 'Forbidden' : 'Unauthorized');
         }
 
         // 如果是R2渠道的图片，需要删除R2中对应的图片

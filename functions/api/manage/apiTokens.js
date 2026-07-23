@@ -25,7 +25,15 @@ export async function onRequest(context) {
     // POST - 创建新Token
     if (method === 'POST') {
         const body = await request.json()
-        const { name, permissions, owner, expiresAt = null, autoDelete = false } = body
+        const {
+            name,
+            permissions,
+            owner,
+            expiresAt = null,
+            autoDelete = false,
+            scope = null,
+            userId = null,
+        } = body
 
         if (!name || !permissions || !owner) {
             return new Response(JSON.stringify({ error: '缺少必要参数' }), {
@@ -36,7 +44,22 @@ export async function onRequest(context) {
             })
         }
 
-        const token = await createApiToken(db, name, permissions, owner, expiresAt, autoDelete)
+        // 决策 10/13：新建必须带 scope；user 必须带 userId
+        const resolvedScope = scope === 'admin' || scope === 'user' ? scope : null
+        if (!resolvedScope) {
+            return new Response(JSON.stringify({ error: '必须指定 scope: admin 或 user' }), {
+                status: 400,
+                headers: { 'content-type': 'application/json' },
+            })
+        }
+        if (resolvedScope === 'user' && !userId) {
+            return new Response(JSON.stringify({ error: 'user scope 必须指定 userId' }), {
+                status: 400,
+                headers: { 'content-type': 'application/json' },
+            })
+        }
+
+        const token = await createApiToken(db, name, permissions, owner, expiresAt, autoDelete, 'user', resolvedScope, userId)
         return new Response(JSON.stringify(token), {
             headers: {
                 'content-type': 'application/json',
@@ -111,7 +134,9 @@ async function getApiTokens(db) {
                 updatedAt: token.updatedAt,
                 token: token.token,
                 expiresAt: token.expiresAt ?? null,
-                autoDelete: token.autoDelete ?? false
+                autoDelete: token.autoDelete ?? false,
+                scope: token.scope || null,
+                userId: token.userId || null,
             }
         })
     
@@ -136,14 +161,27 @@ async function getApiTokens(db) {
         updatedAt: t.updatedAt,
         token: t.token.substr(0, 15) + '...', // 只显示前15位
         expiresAt: t.expiresAt,
-        autoDelete: t.autoDelete
+        autoDelete: t.autoDelete,
+        scope: t.scope || null,
+        userId: t.userId || null,
+        invalid: !t.scope, // 旧 token 无 scope，校验时拒绝
     }))
     
     return { tokens: tokenList }
 }
 
 // 创建新的API Token
-export async function createApiToken(db, name, permissions, owner, expiresAt = null, autoDelete = false, type = 'user') {
+export async function createApiToken(
+    db,
+    name,
+    permissions,
+    owner,
+    expiresAt = null,
+    autoDelete = false,
+    type = 'user',
+    scope = 'admin',
+    userId = null,
+) {
     const settingsStr = await db.get('manage@sysConfig@security')
     const settings = settingsStr ? JSON.parse(settingsStr) : {}
     
@@ -162,6 +200,8 @@ export async function createApiToken(db, name, permissions, owner, expiresAt = n
         owner,
         permissions,
         type,
+        scope,
+        userId: scope === 'user' ? userId : null,
         createdAt: now,
         updatedAt: now,
         expiresAt: expiresAt ?? null,
@@ -179,6 +219,8 @@ export async function createApiToken(db, name, permissions, owner, expiresAt = n
         token,
         owner,
         permissions,
+        scope: tokenData.scope,
+        userId: tokenData.userId,
         createdAt: now,
         updatedAt: now,
         expiresAt: tokenData.expiresAt,
@@ -277,7 +319,10 @@ export async function getTokenData(db, token) {
                 createdAt: t.createdAt,
                 updatedAt: t.updatedAt,
                 expiresAt: t.expiresAt ?? null,
-                autoDelete: t.autoDelete ?? false
+                autoDelete: t.autoDelete ?? false,
+                scope: t.scope || null,
+                userId: t.userId || null,
+                type: t.type || 'user',
             }
         }
     }

@@ -4,6 +4,7 @@
  */
 import { findConfiguredChannel, loadChannelConfig } from './channelConfig.js';
 import { normalizeWebDAVHeaders } from '../storage/webdavAPI.js';
+import { resolveUploadConfigForFileOwner } from '../userUploadConfig.js';
 
 /* ========== 主要函数 ========== */
 
@@ -129,7 +130,18 @@ export async function resolveWebDAVCredentials(db, env, metadata = {}) {
 /* ========== 关键函数 ========== */
 
 // 统一加载上传配置并定位 metadata 对应渠道
+// 优先文件 OwnerId 的用户渠道，再回落管理员（覆盖用户回落管理员渠道上传场景）
 async function loadConfiguredChannel(db, env, groupName, metadata = {}) {
+  const ownerId = metadata?.OwnerId || metadata?.ownerId || null;
+  if (ownerId) {
+    try {
+      const ownerConfig = await resolveUploadConfigForFileOwner(env, ownerId);
+      const channel = findConfiguredChannel(ownerConfig, groupName, metadata);
+      if (channel) return channel;
+    } catch (e) {
+      console.warn('resolveUploadConfigForFileOwner failed:', e.message);
+    }
+  }
   const uploadConfig = await loadChannelConfig(db, env, `${groupName} credentials`);
   return findConfiguredChannel(uploadConfig, groupName, metadata);
 }

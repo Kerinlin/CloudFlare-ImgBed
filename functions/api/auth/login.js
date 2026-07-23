@@ -1,41 +1,68 @@
-import { fetchSecurityConfig } from "../../utils/sysConfig.js";
-import { verifyPassword, rehashIfNeeded } from "../../utils/auth/passwordHash.js";
 import { createSession } from "../../utils/auth/sessionManager.js";
-import { getDatabase } from "../../utils/databaseAdapter.js";
+import { verifyUserLogin } from "../../utils/userStore.js";
 
+/**
+ * 用户登录：用户名 + 密码（多用户）
+ * 废弃全局 authCode
+ */
 export async function onRequestPost(context) {
     const { request, env } = context;
 
-    const jsonRequest = await request.json();
-    const authCode = jsonRequest.authCode;
-
-    // 读取安全设置
-    let securityConfig;
+    let body;
     try {
-        securityConfig = await fetchSecurityConfig(env, { throwOnError: true });
-    } catch (error) {
-        console.error('User login blocked because security config could not be loaded:', error);
-        return new Response('Security config unavailable', { status: 503 });
-    }
-    const rightAuthCode = securityConfig.auth.user.authCode;
-
-    // 验证 authCode（兼容明文、SHA-256 和 PBKDF2 三种存储格式）
-    if (rightAuthCode !== undefined && rightAuthCode !== '') {
-        const isValid = await verifyPassword(authCode, rightAuthCode);
-        if (!isValid) {
-            return new Response('Unauthorized', { status: 401 });
-        }
-
-        // 登录成功后，自动升级旧版哈希为 PBKDF2
-        await rehashIfNeeded(getDatabase(env), authCode, rightAuthCode, 'auth.user.authCode');
+        body = await request.json();
+    } catch {
+        return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+        });
     }
 
-    // 创建会话并通过 HttpOnly Cookie 返回
-    const { cookie } = await createSession(env, 'user');
+    // 拒绝旧 authCode 登录
+    if (body.authCode !== undefined && body.username === undefined) {
+        return new Response(JSON.stringify({
+            error: 'authCode login removed; use username/password',
+            code: 'AUTHCODE_REMOVED',
+        }), {
+            status: 410,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
 
-    return new Response('Login success', {
+    const username = body.username;
+    const password = body.password;
+
+    if (!username || !password) {
+        return new Response(JSON.stringify({ error: 'username and password required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    const result = await verifyUserLogin(env, username, password);
+    if (!result.ok) {
+        const status = result.error === 'Account disabled' ? 403 : 401;
+        return new Response(JSON.stringify({ error: result.error || 'Unauthorized' }), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    const user = result.user;
+    const { cookie } = await createSession(env, 'user', {
+        username: user.username,
+        userId: user.id,
+    });
+
+    return new Response(JSON.stringify({
+        success: true,
+        userId: user.id,
+        username: user.username,
+        displayName: user.displayName || '',
+    }), {
         status: 200,
         headers: {
+            'Content-Type': 'application/json',
             'Set-Cookie': cookie,
         },
     });

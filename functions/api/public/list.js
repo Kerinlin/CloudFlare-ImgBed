@@ -148,6 +148,20 @@ export async function onRequest(context) {
             });
         }
 
+        // 多用户隔离：公开列表固定返回空，避免摊开各用户文件（决策 11）
+        // 直链 /file 仍公开；精细上墙二期
+        console.warn('public browse list forced empty under multi-user isolation policy');
+        return new Response(JSON.stringify({
+            files: [],
+            directories: [],
+            totalCount: 0,
+            fromCache: false,
+            multiUserIsolation: true,
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+
         // 解析允许的目录
         const allowedDirStr = publicBrowse.allowedDir || '';
         let allowedDirs = allowedDirStr.split(',').map(d => d.trim()).filter(d => d);
