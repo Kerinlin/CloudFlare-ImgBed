@@ -1,5 +1,9 @@
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { filterAutoDeleteTokens } from '../../utils/auth/tokenExpiration.js';
+import { getUserById } from '../../utils/userStore.js';
+
+/** 普通用户 Token 允许的权限（不含 manage，防止越权管理端） */
+const USER_TOKEN_PERMISSIONS = new Set(['upload', 'delete', 'list']);
 
 export async function onRequest(context) {
     // API Token管理，支持创建、删除、列出Token
@@ -59,7 +63,44 @@ export async function onRequest(context) {
             })
         }
 
-        const token = await createApiToken(db, name, permissions, owner, expiresAt, autoDelete, 'user', resolvedScope, userId)
+        let resolvedPermissions = Array.isArray(permissions) ? [...permissions] : []
+        let resolvedUserId = null
+        if (resolvedScope === 'user') {
+            const user = await getUserById(env, userId)
+            if (!user) {
+                return new Response(JSON.stringify({ error: '指定用户不存在' }), {
+                    status: 400,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (user.disabled) {
+                return new Response(JSON.stringify({ error: '用户已禁用，无法签发 Token' }), {
+                    status: 400,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            resolvedUserId = user.id
+            // 用户 Token 只能控制本人数据：剥离 manage
+            resolvedPermissions = resolvedPermissions.filter((p) => USER_TOKEN_PERMISSIONS.has(p))
+            if (resolvedPermissions.length === 0) {
+                return new Response(JSON.stringify({ error: '用户 Token 权限无效，请至少选择 upload/list/delete' }), {
+                    status: 400,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+        }
+
+        const token = await createApiToken(
+            db,
+            name,
+            resolvedPermissions,
+            owner,
+            expiresAt,
+            autoDelete,
+            'user',
+            resolvedScope,
+            resolvedUserId,
+        )
         return new Response(JSON.stringify(token), {
             headers: {
                 'content-type': 'application/json',
@@ -102,7 +143,20 @@ export async function onRequest(context) {
             })
         }
 
-        const result = await updateApiToken(db, tokenId, permissions, expiresAt, autoDelete)
+        // user scope Token 更新时同样剥离 manage
+        const existing = await getApiTokenRecord(db, tokenId)
+        let nextPermissions = Array.isArray(permissions) ? [...permissions] : []
+        if (existing?.scope === 'user') {
+            nextPermissions = nextPermissions.filter((p) => USER_TOKEN_PERMISSIONS.has(p))
+            if (nextPermissions.length === 0) {
+                return new Response(JSON.stringify({ error: '用户 Token 权限无效，请至少选择 upload/list/delete' }), {
+                    status: 400,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+        }
+
+        const result = await updateApiToken(db, tokenId, nextPermissions, expiresAt, autoDelete)
         return new Response(JSON.stringify(result), {
             headers: {
                 'content-type': 'application/json',
@@ -226,6 +280,13 @@ export async function createApiToken(
         expiresAt: tokenData.expiresAt,
         autoDelete: tokenData.autoDelete
     }
+}
+
+/** 读取单条 Token 记录（含 scope/userId） */
+async function getApiTokenRecord(db, tokenId) {
+    const settingsStr = await db.get('manage@sysConfig@security')
+    const settings = settingsStr ? JSON.parse(settingsStr) : {}
+    return settings.apiTokens?.tokens?.[tokenId] || null
 }
 
 // 删除API Token
